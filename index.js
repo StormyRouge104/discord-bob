@@ -1,101 +1,69 @@
 import 'dotenv/config';
 import fetch from 'node-fetch';
-import {
-  Client, GatewayIntentBits,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  EmbedBuilder, InteractionType
-} from 'discord.js';
+import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, AttachmentBuilder } from 'discord.js';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const imageCache = new Map();
+const cache = new Map();
+
+const getImages = async (q, skip = []) => {
+  const r = await fetch(`http://localhost:8888/search?q=${encodeURIComponent(q)}&format=json&categories=images&engines=google`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const j = await r.json();
+  const urls = [];
+  for (const x of j.results) {
+    if (!x.img_src || x.img_src.startsWith('data:') || skip.includes(x.img_src)) continue;
+    try { const h = await fetch(x.img_src, { method: 'HEAD' }); if (!h.ok || !h.headers.get('content-type')?.startsWith('image/')) continue; urls.push(x.img_src); if (urls.length >= 5) break } catch {}
+  }
+  return urls;
+};
+
+const buttons = urls => [
+  new ActionRowBuilder().addComponents(urls.map((_, i) => new ButtonBuilder().setCustomId(`pick_${i}`).setLabel(`${i+1}️⃣`).setStyle(ButtonStyle.Primary))),
+  new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('refresh').setLabel('🔄').setStyle(ButtonStyle.Secondary))
+];
+
+const sendImage = async (ch, url, user) => {
+  try {
+    const r = await fetch(url), t = r.headers.get('content-type')?.split('/')[1] === 'jpeg' ? 'jpg' : r.headers.get('content-type')?.split('/')[1];
+    const buf = Buffer.from(await r.arrayBuffer());
+    await ch.send({ content: `${user} выбрал через /pic:`, files: [new AttachmentBuilder(buf, { name: `image.${t}` })], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`delete_${user.id}`).setLabel('🗑️').setStyle(ButtonStyle.Danger))] });
+  } catch { await ch.send({ content: `${user} выбрал картинку, но её не удалось загрузить.` }); }
+};
 
 client.once('ready', () => console.log(`✅ Logged in as ${client.user.tag}`));
 
-async function getImages(query, exclude = []) {
-  const res = await fetch(
-    `http://localhost:8888/search?q=${encodeURIComponent(query)}&format=json&categories=images&engines=google`,
-    { headers: { 'User-Agent': 'Mozilla/5.0' } }
-  );
-  const data = await res.json();
-  const fresh = data.results
-    .filter(r => r.img_src && !r.img_src.startsWith('data:'))
-    .map(r => r.img_src)
-    .filter(url => !exclude.includes(url));
-  return fresh.slice(0, 5);
-}
-
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'pic') return;
-
-  await interaction.deferReply({ ephemeral: true });
-  const query = interaction.options.getString('query');
-  const urls = await getImages(query);
-  if (!urls.length) return interaction.editReply('Ничего не найдено.');
-
-  imageCache.set(interaction.user.id, { query, urls });
-
-  const embeds = urls.map((url, i) => new EmbedBuilder().setImage(url).setFooter({ text: `Выбери картинку` }));
-
-  const row1 = new ActionRowBuilder().addComponents(
-    urls.map((_, i) => new ButtonBuilder()
-      .setCustomId(`pick_${i}`)
-      .setLabel(`${i + 1}️⃣`)
-      .setStyle(ButtonStyle.Primary))
-  );
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('refresh')
-      .setLabel('🔄')
-      .setStyle(ButtonStyle.Secondary)
-  );
-
-  await interaction.editReply({ embeds, components: [row1, row2] });
-});
-
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isButton()) return;
-  const data = imageCache.get(interaction.user.id);
-  if (!data) return interaction.reply({ content: 'Сессия истекла', ephemeral: true });
-
-  if (interaction.customId === 'refresh') {
-    const allPrev = data.urls;
-    const newUrls = await getImages(data.query, allPrev);
-    if (!newUrls.length) return interaction.reply({ content: 'Новых изображений не найдено.', ephemeral: true });
-
-    imageCache.set(interaction.user.id, { query: data.query, urls: newUrls });
-
-    const newEmbeds = newUrls.map(url => new EmbedBuilder().setImage(url).setFooter({ text: `Выбери картинку` }));
-    const row1 = new ActionRowBuilder().addComponents(
-      newUrls.map((_, i) => new ButtonBuilder()
-        .setCustomId(`pick_${i}`)
-        .setLabel(`${i + 1}️⃣`)
-        .setStyle(ButtonStyle.Primary))
-    );
-    const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('refresh')
-        .setLabel('🔄')
-        .setStyle(ButtonStyle.Secondary)
-    );
-
-    try {
-      await interaction.update({ embeds: newEmbeds, components: [row1, row2] });
-    } catch (err) {
-      console.error(err);
-    }
-    return;
+client.on('interactionCreate', async i => {
+  if (i.isChatInputCommand() && i.commandName === 'pic') {
+    await i.deferReply({ ephemeral: true });
+    const q = i.options.getString('query'), urls = await getImages(q);
+    if (!urls.length) return i.editReply('Ничего не найдено');
+    cache.set(i.user.id, { urls, q });
+    return i.editReply({ embeds: urls.map(u => new EmbedBuilder().setImage(u).setFooter({ text: 'Выбери картинку' })), components: buttons(urls) });
   }
 
-  if (interaction.customId.startsWith('pick_')) {
-    const index = parseInt(interaction.customId.split('_')[1]);
-    const imageUrl = data.urls[index];
+  if (!i.isButton()) return;
+  const data = cache.get(i.user.id);
 
+  if (i.customId === 'refresh') {
+    if (!data) return i.reply({ content: 'Сессия истекла', ephemeral: true });
+    await i.deferUpdate();
     try {
-      await interaction.update({ content: 'Выбор принят', embeds: [], components: [] });
-      await interaction.channel.send({ content: `${interaction.user} выбрал via /pic:`, files: [imageUrl] });
-    } catch (err) {
-      console.error(err);
-    }
+      const urls = await getImages(data.q, data.urls);
+      if (!urls.length) return i.followUp({ content: 'Новых изображений не найдено', ephemeral: true });
+      cache.set(i.user.id, { q: data.q, urls });
+      return i.editReply({ embeds: urls.map(u => new EmbedBuilder().setImage(u).setFooter({ text: 'Выбери картинку' })), components: buttons(urls) });
+    } catch (e) { console.error(e); return i.followUp({ content: 'Ошибка при обновлении', ephemeral: true }); }
+  }
+
+  if (i.customId.startsWith('pick_')) {
+    if (!data) return i.reply({ content: 'Сессия истекла', ephemeral: true });
+    await sendImage(i.channel, data.urls[parseInt(i.customId.split('_')[1])], i.user);
+    return i.update({ content: 'Выбор принят', embeds: [], components: [] });
+  }
+
+  if (i.customId.startsWith('delete_')) {
+    if (i.user.id !== i.customId.split('_')[1]) return i.reply({ content: 'Вы не можете удалить это сообщение', ephemeral: true });
+    await i.message.delete().catch(() => {});
+    return i.reply({ content: 'Сообщение удалено', ephemeral: true });
   }
 });
 
